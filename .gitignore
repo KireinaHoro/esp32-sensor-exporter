@@ -6,3 +6,8 @@
 
 # do not check in wifi credentials
 include/wifi-credentials.h
+
+# ignore files from CLion
+CMake*
+cmake-*
+.idea
