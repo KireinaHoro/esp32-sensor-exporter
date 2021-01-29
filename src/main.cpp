@@ -1,9 +1,11 @@
-#include <Arduino.h>
-#include <Wire.h>
-#include <SPI.h>
-#include <Adafruit_Sensor.h>
 #include <Adafruit_BME280.h>
+#include <Adafruit_Sensor.h>
+#include <Arduino.h>
+#include <SPI.h>
 #include <WiFi.h>
+#include <Wire.h>
+
+#define DEBUG
 
 #define BME_SCK 18
 #define BME_MISO 19
@@ -12,13 +14,26 @@
 
 #define SEALEVELPRESSURE_HPA (1013.25)
 
+#define EBAD_FRAME 11
+#define EBAD_CHECKSUM 22
+
+// ESP32 MAC: A4CF125D1330
+
 Adafruit_BME280 bme(BME_CS); // hardware SPI
 
 const int PACKET_LEN = 9;
-const uint8_t measure_cmd[PACKET_LEN] = {0xff, 0x01, 0x86, 0x00, 0x00, 0x00, 0x00, 0x00, 0x79};
-const uint8_t range10k_cmd[PACKET_LEN] = {0xff, 0x01, 0x99, 0x00, 0x00, 0x00, 0x27, 0x10, 0x96};
-const uint8_t range5k_cmd[PACKET_LEN] = {0xff, 0x01, 0x99, 0x00, 0x00, 0x00, 0x13, 0x88, 0x2f};
-const uint8_t range2k_cmd[PACKET_LEN] = {0xff, 0x01, 0x99, 0x00, 0x00, 0x00, 0x07, 0xd0, 0x8f};
+const uint8_t measure_cmd[PACKET_LEN] = {0xff, 0x01, 0x86, 0x00, 0x00,
+                                         0x00, 0x00, 0x00, 0x79};
+const uint8_t range10k_cmd[PACKET_LEN] = {0xff, 0x01, 0x99, 0x00, 0x00,
+                                          0x00, 0x27, 0x10, 0x96};
+const uint8_t range5k_cmd[PACKET_LEN] = {0xff, 0x01, 0x99, 0x00, 0x00,
+                                         0x00, 0x13, 0x88, 0x2f};
+const uint8_t range2k_cmd[PACKET_LEN] = {0xff, 0x01, 0x99, 0x00, 0x00,
+                                         0x00, 0x07, 0xd0, 0x8f};
+const uint8_t autocal_off_cmd[PACKET_LEN] = {0xff, 0x01, 0x79, 0x00, 0x00,
+                                             0x00, 0x00, 0x00, 0x86};
+const uint8_t cal_zero_cmd[PACKET_LEN] = {0xff, 0x01, 0x87, 0x00, 0x00,
+                                          0x00, 0x00, 0x00, 0x77};
 
 // wifi credentials
 #include "wifi-credentials.h"
@@ -53,11 +68,11 @@ int read_co2() {
   write_packet(measure_cmd);
   read_packet(response);
   if (response[1] != 0x86) {
-    return -1;
+    return -EBAD_FRAME;
   }
   uint8_t checksum = get_checksum(response);
   if (checksum != response[8]) {
-    return -1;
+    return -EBAD_CHECKSUM;
   }
   return response[2] * 256 + response[3];
 }
@@ -66,41 +81,52 @@ float temperature, pressure, altitude, humidity;
 int co2;
 
 void update_values() {
-    temperature = bme.readTemperature();
-    pressure = bme.readPressure() / 100.0F;
-    altitude = bme.readAltitude(SEALEVELPRESSURE_HPA);
-    humidity = bme.readHumidity();
-    co2 = read_co2();
+  temperature = bme.readTemperature();
+  pressure = bme.readPressure() / 100.0F;
+  altitude = bme.readAltitude(SEALEVELPRESSURE_HPA);
+  humidity = bme.readHumidity();
+  co2 = read_co2();
 }
 
 void setup() {
-    //Serial.begin(9600);
-    // connect to wifi
-    WiFi.begin(ssid, passwd);
-    while (WiFi.status() != WL_CONNECTED) {
-      delay(500);
-    }
-    //Serial.println(WiFi.localIP());
-    server.begin();
+#ifdef DEBUG
+  Serial.begin(9600);
+#endif
+  // connect to wifi
+  WiFi.begin(ssid, passwd);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+  }
+#ifdef DEBUG
+  Serial.println(WiFi.localIP());
+#endif
+  server.begin();
 
-    // initialize MH-Z19B
-    Serial2.begin(9600);
-    while(!Serial2);
-    // set CO2 range to 10k ppm
-    write_packet(range10k_cmd);
-    //write_packet(range5k_cmd);
+  // initialize MH-Z19B
+  Serial2.begin(9600);
+  while (!Serial2)
+    ;
+  // set CO2 range to 10k ppm
+  write_packet(range10k_cmd);
+  // write_packet(range5k_cmd);
 
-    // initialize BME280
-    if (!bme.begin()) {
-      // BME280 initialization failed
-      while (1) delay(10);
-    }
+  // turn off auto calibration
+  write_packet(autocal_off_cmd);
 
-    // wait until value is ready
-    while (co2 == -1) {
-      update_values();
-      delay(1000);
-    }
+  // initialize BME280
+  if (!bme.begin()) {
+    // BME280 initialization failed
+    while (1)
+      delay(10);
+  }
+
+  update_values();
+  delay(1000);
+
+  while (co2 < 0) {
+    update_values();
+    delay(1000);
+  }
 }
 
 String header;
@@ -111,31 +137,40 @@ void send_metrics(WiFiClient &client) {
   client.printf("# HELP environ_temp Environment temperature (in C).\n");
   client.printf("# TYPE environ_temp gauge\n");
   client.printf("environ_temp{location=\"%s\"} %.2f\n", location, temperature);
-  
-  client.printf("# HELP environ_pressure Environment atmospheric pressure (in hPa).\n");
+
+  client.printf(
+      "# HELP environ_pressure Environment atmospheric pressure (in hPa).\n");
   client.printf("# TYPE environ_pressure gauge\n");
   client.printf("environ_pressure{location=\"%s\"} %.2f\n", location, pressure);
-  
-  client.printf("# HELP environ_altitude Environment altitude from sea level (in m).\n");
+
+  client.printf(
+      "# HELP environ_altitude Environment altitude from sea level (in m).\n");
   client.printf("# TYPE environ_altitude gauge\n");
   client.printf("environ_altitude{location=\"%s\"} %.2f\n", location, altitude);
-  
-  client.printf("# HELP environ_humidity Environment relative humidity (in percentage).\n");
+
+  client.printf("# HELP environ_humidity Environment relative humidity (in "
+                "percentage).\n");
   client.printf("# TYPE environ_humidity gauge\n");
   client.printf("environ_humidity{location=\"%s\"} %.2f\n", location, humidity);
-  
+
   client.printf("# HELP environ_co2 Environment CO2 concentration (in ppm).\n");
   client.printf("# TYPE environ_co2 gauge\n");
   client.printf("environ_co2{location=\"%s\"} %d\n", location, co2);
+}
+
+void calibrate() {
+  write_packet(cal_zero_cmd);
 }
 
 void loop() {
   WiFiClient client = server.available();
 
   if (client) {
-    //Serial.print("New client from ");
-    //Serial.print(client.remoteIP());
-    //Serial.printf(":%d\n", client.remotePort());
+#ifdef DEBUG
+    Serial.print("New client from ");
+    Serial.print(client.remoteIP());
+    Serial.printf(":%d\n", client.remotePort());
+#endif
 
     String currentLine = "";
     while (client.connected()) {
@@ -153,15 +188,24 @@ void loop() {
               client.println("Connection: close");
               client.println(); // end headers
               send_metrics(client);
+            } else if (header.indexOf("GET /calibrate") >= 0) {
+              // calibrate CO2 zero point
+              calibrate();
+              client.println("HTTP/1.1 200 OK");
+              client.println("Content-Type: text/html; charset=utf-8");
+              client.println("Connection: close");
+              client.println(); // end headers
+              client.println("CO2 zero point calibration done");
             } else if (header.indexOf("GET /") >= 0) {
               // something else - link to metrics
               client.println("HTTP/1.1 200 OK");
               client.println("Content-Type: text/html; charset=utf-8");
               client.println("Connection: close");
               client.println(); // end headers
-              client.println("<html><head><title>Environment Sensor @ ESP32</title></head>"
-              "<body><h1>Environment Sensor @ ESP32</h1>"
-              "<p><a href=\"/metrics\">Metrics</a></p></body></html>");
+              client.println(
+                  "<html><head><title>Environment Sensor @ ESP32</title></head>"
+                  "<body><h1>Environment Sensor @ ESP32</h1>"
+                  "<p><a href=\"/metrics\">Metrics</a></p></body></html>");
             } else {
               // terminate with 400 bad request
               client.println("HTTP/1.1 400 Bad Request");
@@ -181,6 +225,8 @@ void loop() {
     header = "";
 
     client.stop();
-    //Serial.println("Client disconnected");
+#ifdef DEBUG
+    Serial.println("Client disconnected");
+#endif
   }
 }
